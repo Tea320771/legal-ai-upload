@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Legal AI Upload Service",
   "dependencies": {
-    "@google/generative-ai": "^0.14.0", 
+    "@google/generative-ai": "^0.17.1",
     "@pdf-lib/fontkit": "^1.1.1",
     "@supabase/supabase-js": "^2.90.1",
     "pdf-lib": "^1.17.1"
