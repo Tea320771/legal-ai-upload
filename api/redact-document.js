@@ -12,17 +12,16 @@ export const config = {
     },
 };
 
-// [업데이트] 로그에서 확인된 사용 가능한 최신 모델 목록
+// 최신 모델 목록 유지
 const MODELS_TO_TRY = [
     "gemini-2.0-flash",
     "gemini-2.5-flash",
     "gemini-flash-latest",
-    "gemini-2.0-flash-lite",
     "gemini-pro-latest"
 ];
 
 export default async function handler(req, res) {
-    console.log("🚀 API 호출됨: redact-document (Dynamic Masking)");
+    console.log("🚀 API 호출됨: redact-document (Multi-page Masking)");
 
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
@@ -61,7 +60,7 @@ export default async function handler(req, res) {
         };
 
         // ============================================================
-        // [Task B] AI 분석 (마스킹 위치 자동 감지)
+        // [Task B] AI 분석 (페이지 넘김 추적)
         // ============================================================
         const analyzeDoc = async () => {
             for (const modelName of MODELS_TO_TRY) {
@@ -73,23 +72,30 @@ export default async function handler(req, res) {
                         generationConfig: { responseMimeType: "application/json" }
                     });
 
-                    // [수정된 프롬프트] 마스킹 비율(maskRatio)을 함께 요청
+                    // [핵심] 페이지 번호(bodyStartPage)까지 요구하는 프롬프트
                     const extractPrompt = `
-                    You are a legal document analyzer. Analyze the first page of this PDF.
-                    1. Extract: court, caseNo, parties, lawyer.
-                    2. Identify the Vertical Position where the main judgment body starts.
-                       - Look for keywords like "변론 종결" (Argument Concluded) or "주문" (Order).
-                       - Return the 'maskRatio' (0.0 to 1.0) indicating how much of the top page should be masked.
-                       - Example: If "변론 종결" is in the middle, maskRatio is 0.5.
-                       - If the header section (parties list) is very long and goes to the next page, return 1.0.
+                    You are a legal document redactor. The document contains personal information (Parties) at the beginning, followed by the main judgment body.
                     
+                    1. **Extract Meta Info**:
+                       - "court": Court name.
+                       - "caseNo": Case number.
+                       - "parties": Names of Plaintiffs(원고), Defendants(피고), AND Intervenors(보조참가인, 독립당사자참가인). Combine them into a single string.
+                       - "lawyer": Legal representatives.
+
+                    2. **Locate Body Start**:
+                       - Find where the header ends and the body begins. Look for keywords: "변론 종결", "판결 선고", "주 문", "청구 취지".
+                       - Identify the **Page Number** (1-based) where this keyword first appears. -> "bodyStartPage"
+                       - Identify the **Vertical Position** (ratio 0.0 to 1.0) on that specific page. -> "bodyStartRatio"
+                       - (Example: If "변론 종결" is at the top of Page 2, bodyStartPage=2, bodyStartRatio=0.1)
+
                     Output JSON only:
                     {
                         "court": "string",
                         "caseNo": "string",
                         "parties": "string",
                         "lawyer": "string",
-                        "maskRatio": number
+                        "bodyStartPage": number,
+                        "bodyStartRatio": number
                     }
                     `;
 
@@ -113,14 +119,14 @@ export default async function handler(req, res) {
                 }
             }
             console.error("❌ 모든 AI 모델 실패");
-            // 실패 시 기본값 (약 45% 지점) 반환
-            return { court: "분석실패", caseNo: "정보없음", parties: "", lawyer: "", maskRatio: 0.45 };
+            // 실패 시 안전하게 1페이지의 절반만 가림 (Fallback)
+            return { court: "분석실패", caseNo: "정보없음", parties: "", lawyer: "", bodyStartPage: 1, bodyStartRatio: 0.5 };
         };
 
         const [fontResult, metaInfo] = await Promise.all([loadFont(), analyzeDoc()]);
 
         // ============================================================
-        // [Task C] PDF 수정 (동적 마스킹)
+        // [Task C] PDF 수정 (다중 페이지 마스킹)
         // ============================================================
         const pdfDoc = await PDFDocument.load(cleanBase64);
         pdfDoc.registerFontkit(fontkit);
@@ -133,34 +139,60 @@ export default async function handler(req, res) {
         }
 
         const pages = pdfDoc.getPages();
-        const firstPage = pages[0];
-        const { width, height } = firstPage.getSize();
+        
+        // 1. 마스킹 위치 계산
+        // AI가 페이지를 못 찾았거나 이상한 값이면 안전하게 1페이지로 설정
+        let startPageIdx = (metaInfo.bodyStartPage || 1) - 1; 
+        let startRatio = metaInfo.bodyStartRatio;
+        
+        if (startPageIdx < 0) startPageIdx = 0;
+        if (typeof startRatio !== 'number') startRatio = 0.5;
 
-        // [핵심] AI가 알려준 비율로 마스킹 높이 계산
-        // 값이 없거나 이상하면 기본값 0.45 사용
-        let ratio = metaInfo.maskRatio;
-        if (typeof ratio !== 'number' || ratio < 0.1 || ratio > 1.0) {
-            ratio = 0.45; 
+        // 약간의 여유(Margin)를 둬서 글자가 잘리지 않게 함
+        // 비율이 0.1(상단)이면 -> 0.15까지 가림
+        // 비율이 0.9(하단)이면 -> 0.95까지 가림
+        startRatio = Math.min(startRatio + 0.05, 1.0);
+
+        console.log(`📏 마스킹 범위: ${startPageIdx + 1}페이지의 ${Math.round(startRatio * 100)}% 지점까지`);
+
+        // 2. 페이지 순회하며 마스킹
+        for (let i = 0; i < pages.length; i++) {
+            const page = pages[i];
+            const { width, height } = page.getSize();
+
+            if (i < startPageIdx) {
+                // [이전 페이지] 본문 시작 전 페이지이므로 "전체 마스킹"
+                // 예: 2페이지가 본문 시작이면, 1페이지는 싹 다 가림
+                page.drawRectangle({
+                    x: 0, y: 0, width: width, height: height,
+                    color: rgb(1, 1, 1),
+                });
+                console.log(`   -> Page ${i + 1}: 전체 마스킹 (헤더가 넘어감)`);
+            } 
+            else if (i === startPageIdx) {
+                // [타겟 페이지] 본문이 시작되는 페이지이므로 "비율만큼 마스킹"
+                const maskHeight = height * startRatio;
+                page.drawRectangle({
+                    x: 0,
+                    y: height - maskHeight,
+                    width: width,
+                    height: maskHeight,
+                    color: rgb(1, 1, 1),
+                });
+                console.log(`   -> Page ${i + 1}: 상단 ${Math.round(startRatio * 100)}% 마스킹`);
+                
+                // 마스킹이 끝나는 페이지에서 루프 종료 (뒤쪽 본문은 건드리지 않음)
+                break;
+            }
         }
         
-        // 약간의 여유 공간(+2%)을 둬서 글자가 잘리지 않게 함
-        const maskHeight = height * ratio;
-
-        console.log(`📏 마스킹 적용: 전체 높이(${height})의 ${Math.round(ratio*100)}% (${maskHeight}px)`);
-
-        // 흰색 사각형 그리기 (위에서부터 maskHeight만큼 덮음)
-        firstPage.drawRectangle({
-            x: 0,
-            y: height - maskHeight, // 바닥 기준 좌표이므로 전체에서 뺌
-            width: width,
-            height: maskHeight,
-            color: rgb(1, 1, 1),
-        });
+        // ============================================================
+        // 3. 추출 정보 기재 (첫 페이지에만 작성)
+        // ============================================================
+        const firstPage = pages[0];
+        const { width: p1Width, height: p1Height } = firstPage.getSize();
         
-        // ============================================================
-        // 정보 다시 쓰기
-        // ============================================================
-        let textY = height - 50;
+        let textY = p1Height - 50;
         const fontSize = 12;
         
         const title = fontResult.type === 'custom' ? "🔒 [보안 처리된 문서]" : "SECURE DOCUMENT";
@@ -169,10 +201,12 @@ export default async function handler(req, res) {
 
         const safeDraw = (label, value) => {
             const valStr = value || '정보없음';
-            const text = fontResult.type === 'custom' ? `${label}: ${valStr}` : `${label}: ${valStr}`;
+            // 줄바꿈 제거 (한 줄로 출력하기 위해)
+            const cleanVal = valStr.replace(/[\r\n]+/g, " "); 
+            const text = fontResult.type === 'custom' ? `${label}: ${cleanVal}` : `${label}: ${cleanVal}`;
             
-            // 내용이 너무 길면 잘라서 표현 (간단한 처리)
-            const maxLength = 60;
+            // 너무 길면 자르기
+            const maxLength = 70;
             const displayStr = text.length > maxLength ? text.substring(0, maxLength) + "..." : text;
             
             firstPage.drawText(displayStr, { x: 50, y: textY, size: fontSize, font: useFont, color: rgb(0, 0, 0) });
@@ -181,7 +215,8 @@ export default async function handler(req, res) {
 
         safeDraw("법원", metaInfo.court);
         safeDraw("사건", metaInfo.caseNo);
-        safeDraw("당사자", metaInfo.parties);
+        // 여기에 모든 당사자(참가인 포함)가 출력됨
+        safeDraw("당사자", metaInfo.parties); 
         safeDraw("대리인", metaInfo.lawyer);
 
         const pdfBytes = await pdfDoc.save();
