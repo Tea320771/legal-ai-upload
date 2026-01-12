@@ -83,12 +83,20 @@
     }
 
     // 메인 로직: 파일을 서버로 전송 (업로드는 서버가 알아서 함)
-    async function processAndUploadFiles() {
+        async function processAndUploadFiles() {
         btnProcess.disabled = true;
         btnProcess.innerText = "서버에서 처리 중...";
 
         for (let i = 0; i < selectedFiles.length; i++) {
             const file = selectedFiles[i];
+            
+            // [추가] 파일 용량 사전 검사 (4MB 초과 시 경고 후 건너뜀)
+            if (file.size > 4 * 1024 * 1024) {
+                updateStatus(i, "❌ 실패: 용량 초과 (4MB 이하만 가능)", "error");
+                alert(`"${file.name}" 파일이 너무 큽니다. (Vercel 무료 제한: 4MB)\n압축하거나 작은 파일을 올려주세요.`);
+                continue; // 다음 파일로 넘어감
+            }
+
             updateStatus(i, "📡 서버 전송 및 처리 중...", "processing");
 
             try {
