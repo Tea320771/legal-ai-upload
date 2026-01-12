@@ -4,6 +4,27 @@ import fontkit from '@pdf-lib/fontkit';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
 
+export default async function handler(req, res) {
+    // 1. [디버깅] 환경변수 로드 확인 (값 자체는 보안상 출력 X)
+    console.log("🔍 API 시작: 환경변수 확인 중...");
+    if (!process.env.SUPABASE_URL) console.error("❌ 에러: SUPABASE_URL 없음");
+    if (!process.env.SUPABASE_KEY) console.error("❌ 에러: SUPABASE_KEY 없음");
+    if (!process.env.GEMINI_API_KEY) console.error("❌ 에러: GEMINI_API_KEY 없음");
+
+    // 2. [디버깅] 모듈 로드 확인
+    try {
+        const testSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+        console.log("✅ Supabase 클라이언트 생성 성공");
+    } catch (e) {
+        console.error("❌ Supabase 클라이언트 생성 실패:", e);
+        return res.status(500).json({ error: "Supabase 초기화 실패: " + e.message });
+    }
+
+    if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
+
+    try {
+        console.log("🚀 메인 로직 진입");
+
 // 환경변수 설정
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
