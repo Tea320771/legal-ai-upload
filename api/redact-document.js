@@ -2,12 +2,13 @@
 import { PDFDocument, rgb } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { createClient } from '@supabase/supabase-js'; // [추가]
+import { createClient } from '@supabase/supabase-js';
 
-// [보안] 환경변수에서 키를 가져옵니다. (코드에 노출 X)
+// 환경변수 설정
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
+// 파일 용량 제한 설정 (10MB)
 export const config = {
     api: {
         bodyParser: {
@@ -20,42 +21,51 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
     try {
-        const { fileBase64, fileName, fileType } = req.body; // fileName 추가 수신
+        const { fileBase64, fileName, fileType } = req.body;
         if (!fileBase64) throw new Error("파일 데이터가 없습니다.");
 
-        // ---------------------------------------------------------
-        // 1. AI 정보 추출 (Gemini)
-        // ---------------------------------------------------------
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const extractPrompt = `
-        이 판결문 문서의 첫 페이지 상단을 읽고 다음 정보를 JSON으로 추출해.
-        {
-            "court": "법원명",
-            "caseNo": "사건번호",
-            "parties": "원고 및 피고 이름",
-            "lawyer": "소송대리인"
-        }
-        `;
-
-        const aiResult = await model.generateContent([
-            { text: extractPrompt },
-            { inlineData: { data: fileBase64, mimeType: "application/pdf" } }
-        ]);
+        // ============================================================
+        // [핵심 수정] 병렬 처리 (Promise.all)
+        // Gemini 분석과 폰트 다운로드를 '동시에' 시작해서 시간을 절약합니다.
+        // ============================================================
         
-        let metaInfo = { court: "", caseNo: "", parties: "", lawyer: "" };
-        try {
-            let text = aiResult.response.text().replace(/```json/g, "").replace(/```/g, "").trim();
-            metaInfo = JSON.parse(text);
-        } catch (e) { console.warn("AI 추출 실패:", e); }
+        // 1. Gemini 분석 작업 정의
+        const analysisPromise = (async () => {
+            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+            const extractPrompt = `
+            이 판결문 문서의 첫 페이지 상단을 읽고 다음 정보를 JSON으로 추출해.
+            {
+                "court": "법원명",
+                "caseNo": "사건번호",
+                "parties": "원고 및 피고 이름",
+                "lawyer": "소송대리인"
+            }
+            `;
+            const result = await model.generateContent([
+                { text: extractPrompt },
+                { inlineData: { data: fileBase64, mimeType: "application/pdf" } }
+            ]);
+            
+            let metaInfo = { court: "", caseNo: "", parties: "", lawyer: "" };
+            try {
+                let text = result.response.text().replace(/```json/g, "").replace(/```/g, "").trim();
+                metaInfo = JSON.parse(text);
+            } catch (e) { console.warn("AI 추출 실패:", e); }
+            return metaInfo;
+        })();
 
-        // ---------------------------------------------------------
-        // 2. PDF 비식별화 (Masking & Rewriting)
-        // ---------------------------------------------------------
+        // 2. 폰트 다운로드 작업 정의
+        const fontPromise = fetch('https://github.com/google/fonts/raw/main/ofl/notosanskr/NotoSansKR-Bold.otf')
+            .then(res => res.arrayBuffer());
+
+        // 3. 두 작업이 다 끝날 때까지 기다림 (병렬 실행)
+        const [metaInfo, fontBytes] = await Promise.all([analysisPromise, fontPromise]);
+
+        // ============================================================
+        // 4. PDF 비식별화 (Masking & Rewriting)
+        // ============================================================
         const pdfDoc = await PDFDocument.load(fileBase64);
         pdfDoc.registerFontkit(fontkit);
-
-        const fontUrl = 'https://github.com/google/fonts/raw/main/ofl/notosanskr/NotoSansKR-Bold.otf';
-        const fontBytes = await fetch(fontUrl).then(res => res.arrayBuffer());
         const koreanFont = await pdfDoc.embedFont(fontBytes);
 
         const pages = pdfDoc.getPages();
@@ -85,16 +95,14 @@ export default async function handler(req, res) {
         drawLine("당사자", metaInfo.parties);
         drawLine("대리인", metaInfo.lawyer);
 
-        const pdfBytes = await pdfDoc.save(); // 수정된 PDF 바이너리 데이터
+        const pdfBytes = await pdfDoc.save();
 
-        // ---------------------------------------------------------
-        // 3. [변경점] 서버에서 바로 Supabase 업로드
-        // ---------------------------------------------------------
+        // ============================================================
+        // 5. Supabase 업로드
+        // ============================================================
         const timestamp = new Date().getTime();
-        // 파일명 안전하게 변경
         const safeName = `SECURE_${timestamp}_${fileName.replace(/[^a-zA-Z0-9.]/g, "_")}`;
 
-        // Supabase Storage 업로드
         const { error: uploadError } = await supabase.storage
             .from('legal-docs')
             .upload(safeName, pdfBytes, {
@@ -103,8 +111,9 @@ export default async function handler(req, res) {
 
         if (uploadError) throw uploadError;
 
-        // (선택) 대기열 DB 등록도 여기서 처리하면 더 안전함
         const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/legal-docs/${safeName}`;
+        
+        // 대기열 등록
         await supabase.from('document_queue').insert({
             filename: fileName,
             file_url: publicUrl,
@@ -112,10 +121,9 @@ export default async function handler(req, res) {
             ai_result: {}
         });
 
-        // 4. 결과 반환 (성공 여부만 프론트로 전달)
         return res.status(200).json({ 
             success: true, 
-            message: "비식별화 및 업로드 완료",
+            message: "완료",
             fileUrl: publicUrl,
             extractedMeta: metaInfo
         });
