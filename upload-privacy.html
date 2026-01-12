@@ -9,18 +9,37 @@
         .container { max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
         h1 { margin-top: 0; color: #0f172a; }
         
-        .upload-area { border: 2px dashed #cbd5e1; padding: 40px; text-align: center; border-radius: 8px; background: #f1f5f9; cursor: pointer; transition: 0.2s; margin-bottom: 20px; }
+        /* [수정] 드래그 앤 드롭 영역 스타일 */
+        .upload-area { 
+            border: 2px dashed #cbd5e1; 
+            padding: 40px; 
+            text-align: center; 
+            border-radius: 8px; 
+            background: #f1f5f9; 
+            cursor: pointer; 
+            transition: 0.2s; 
+            margin-bottom: 20px; 
+        }
+        
+        /* 마우스 호버 효과 */
         .upload-area:hover { border-color: #3b82f6; background: #eff6ff; }
+        
+        /* [추가] 드래그해서 파일이 들어왔을 때 강조 효과 */
+        .upload-area.highlight {
+            border-color: #2563eb;
+            background-color: #dbeafe;
+            transform: scale(1.02);
+        }
         
         .file-list { margin-top: 20px; }
         .file-item { display: flex; justify-content: space-between; align-items: center; padding: 15px; background: #fff; border: 1px solid #e2e8f0; margin-bottom: 10px; border-radius: 6px; }
         
         .status { font-size: 0.85rem; font-weight: bold; padding: 4px 8px; border-radius: 4px; }
         .status.waiting { background: #e2e8f0; color: #64748b; }
-        .status.processing { background: #dbeafe; color: #2563eb; } /* 파란색: 처리중 */
-        .status.uploading { background: #fef3c7; color: #d97706; } /* 노란색: 업로드중 */
-        .status.done { background: #dcfce7; color: #166534; }       /* 초록색: 완료 */
-        .status.error { background: #fee2e2; color: #dc2626; }      /* 빨간색: 에러 */
+        .status.processing { background: #dbeafe; color: #2563eb; } 
+        .status.uploading { background: #fef3c7; color: #d97706; } 
+        .status.done { background: #dcfce7; color: #166534; }       
+        .status.error { background: #fee2e2; color: #dc2626; }      
 
         .btn { background: #0f172a; color: white; border: none; padding: 15px; border-radius: 6px; font-weight: bold; cursor: pointer; width: 100%; margin-top: 20px; font-size: 1rem; }
         .btn:disabled { background: #94a3b8; cursor: not-allowed; }
@@ -31,15 +50,16 @@
 <div class="container">
     <h1>🛡️ 판결문 보안 처리 및 업로드</h1>
     <p style="color:#64748b; margin-bottom:30px;">
-        1. AI가 판결문의 <b>[법원/사건번호/대리인]</b> 정보를 추출합니다.<br>
-        2. 상단 개인정보 영역을 <b>하얗게 가리고(Masking)</b> 추출한 정보를 다시 기재합니다.<br>
-        3. 보안 처리된 파일을 <b>Supabase</b>에 저장합니다.
+        1. AI가 판결문의 <b>[주문/청구취지/당사자]</b> 정보를 분석하고 가명 처리합니다.<br>
+        2. 인적사항 영역을 <b>동적으로 마스킹</b>하고 재구성된 텍스트를 기재합니다.<br>
+        3. 보안 처리된 파일을 안전하게 저장합니다.
     </p>
 
     <input type="file" id="fileInput" multiple accept=".pdf" style="display:none">
-    <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+    
+    <div id="dropArea" class="upload-area" onclick="document.getElementById('fileInput').click()">
         <div style="font-size: 3rem; margin-bottom: 10px;">📂</div>
-        <h3 style="margin: 0;">판결문 PDF 파일을 이곳에 놓으세요</h3>
+        <h3 style="margin: 0;">판결문 PDF 파일을 이곳에 드래그하거나 클릭하세요</h3>
         <p style="font-size: 0.9rem; color: #64748b;">(여러 개 동시 선택 가능)</p>
     </div>
 
@@ -50,20 +70,55 @@
 </div>
 
 <script>
-    // [중요] 이제 여기에 Supabase 키를 적을 필요가 없습니다! (보안 강화)
-
     const fileInput = document.getElementById('fileInput');
     const fileListEl = document.getElementById('fileList');
     const btnProcess = document.getElementById('btnProcess');
+    const dropArea = document.getElementById('dropArea'); // 드래그 영역
     let selectedFiles = [];
 
+    // 1. 기존 클릭 업로드 방식
     fileInput.addEventListener('change', (e) => {
-        if (e.target.files.length > 0) {
-            selectedFiles = Array.from(e.target.files);
+        handleFiles(e.target.files);
+    });
+
+    // 2. [추가] Drag & Drop 이벤트 처리
+    
+    // 기본 브라우저 동작(파일 열기 등) 방지
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        dropArea.addEventListener(eventName, preventDefaults, false);
+    });
+
+    function preventDefaults(e) {
+        e.preventDefault();
+        e.stopPropagation();
+    }
+
+    // 드래그 들어오면 강조 효과 (Highlight)
+    ['dragenter', 'dragover'].forEach(eventName => {
+        dropArea.addEventListener(eventName, () => dropArea.classList.add('highlight'), false);
+    });
+
+    // 드래그 나가거나 놓으면 강조 해제
+    ['dragleave', 'drop'].forEach(eventName => {
+        dropArea.addEventListener(eventName, () => dropArea.classList.remove('highlight'), false);
+    });
+
+    // 파일을 놓았을 때 (Drop)
+    dropArea.addEventListener('drop', (e) => {
+        const dt = e.dataTransfer;
+        const files = dt.files;
+        handleFiles(files);
+    });
+
+    // 3. 공통 파일 처리 함수
+    function handleFiles(files) {
+        if (files.length > 0) {
+            // 기존 파일 목록을 덮어쓰거나 합칠 수 있음 (여기선 덮어쓰기 방식)
+            selectedFiles = Array.from(files);
             renderFileList();
             btnProcess.style.display = 'block';
         }
-    });
+    }
 
     function renderFileList() {
         fileListEl.innerHTML = '';
@@ -78,29 +133,30 @@
 
     function updateStatus(index, text, type) {
         const el = document.getElementById(`status-${index}`);
-        el.innerText = text;
-        el.className = `status ${type}`;
+        if(el) {
+            el.innerText = text;
+            el.className = `status ${type}`;
+        }
     }
 
-    // 메인 로직: 파일을 서버로 전송 (업로드는 서버가 알아서 함)
-        async function processAndUploadFiles() {
+    // 메인 로직: 서버 전송
+    async function processAndUploadFiles() {
         btnProcess.disabled = true;
         btnProcess.innerText = "서버에서 처리 중...";
 
         for (let i = 0; i < selectedFiles.length; i++) {
             const file = selectedFiles[i];
             
-            // [추가] 파일 용량 사전 검사 (4MB 초과 시 경고 후 건너뜀)
+            // 용량 사전 검사 (4MB 초과 시 경고)
             if (file.size > 4 * 1024 * 1024) {
-                updateStatus(i, "❌ 실패: 용량 초과 (4MB 이하만 가능)", "error");
-                alert(`"${file.name}" 파일이 너무 큽니다. (Vercel 무료 제한: 4MB)\n압축하거나 작은 파일을 올려주세요.`);
-                continue; // 다음 파일로 넘어감
+                updateStatus(i, "❌ 실패: 용량 초과 (4MB 이하)", "error");
+                continue;
             }
 
             updateStatus(i, "📡 서버 전송 및 처리 중...", "processing");
 
             try {
-                // 1. 파일을 Base64로 변환
+                // Base64 변환
                 const reader = new FileReader();
                 const base64Promise = new Promise(resolve => {
                     reader.onload = (e) => resolve(e.target.result);
@@ -108,35 +164,29 @@
                 });
                 const base64 = await base64Promise;
 
-                // 2. API 호출 (파일명도 같이 보냄)
+                // API 호출
+                const response = await fetch('/api/redact-document', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        fileBase64: base64, 
+                        fileName: file.name, 
+                        fileType: file.type 
+                    })
+                });
 
- // 기존: const response = await fetch(...)
-const response = await fetch('/api/redact-document', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ 
-        fileBase64: base64, 
-        fileName: file.name, 
-        fileType: file.type 
-    })
-});
+                const responseText = await response.text();
 
-// [수정] JSON 파싱 전에 에러인지 먼저 확인
-const responseText = await response.text();
+                if (!response.ok) {
+                    let errorMsg = responseText;
+                    if (responseText.startsWith("<")) {
+                        errorMsg = "서버 오류 (타임아웃/용량 등)";
+                    }
+                    throw new Error(`(${response.status}): ${errorMsg}`);
+                }
 
-if (!response.ok) {
-    // HTML 에러 페이지가 올 경우 태그 제거하고 앞부분만 보여줌
-    let errorMsg = responseText;
-    if (responseText.startsWith("<")) {
-        errorMsg = "서버 타임아웃(10초 초과) 또는 용량 초과입니다.";
-    }
-    throw new Error(`서버 오류 (${response.status}): ${errorMsg}`);
-}
-
-const result = JSON.parse(responseText); // 이제 안전하게 파싱
-
-                // 3. 완료 처리
-                updateStatus(i, `✅ 저장 완료 (${result.extractedMeta.court || '완료'})`, "done");
+                const result = JSON.parse(responseText); 
+                updateStatus(i, `✅ 완료 (${result.extractedMeta?.court || '저장됨'})`, "done");
 
             } catch (e) {
                 console.error(e);
@@ -146,7 +196,7 @@ const result = JSON.parse(responseText); // 이제 안전하게 파싱
 
         btnProcess.disabled = false;
         btnProcess.innerText = "모든 작업 완료";
-        alert("모든 파일이 안전하게 서버에 저장되었습니다.");
+        alert("작업이 완료되었습니다.");
     }
 </script>
 
