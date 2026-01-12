@@ -4,32 +4,11 @@ import fontkit from '@pdf-lib/fontkit';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
 
-export default async function handler(req, res) {
-    // 1. [디버깅] 환경변수 로드 확인 (값 자체는 보안상 출력 X)
-    console.log("🔍 API 시작: 환경변수 확인 중...");
-    if (!process.env.SUPABASE_URL) console.error("❌ 에러: SUPABASE_URL 없음");
-    if (!process.env.SUPABASE_KEY) console.error("❌ 에러: SUPABASE_KEY 없음");
-    if (!process.env.GEMINI_API_KEY) console.error("❌ 에러: GEMINI_API_KEY 없음");
-
-    // 2. [디버깅] 모듈 로드 확인
-    try {
-        const testSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-        console.log("✅ Supabase 클라이언트 생성 성공");
-    } catch (e) {
-        console.error("❌ Supabase 클라이언트 생성 실패:", e);
-        return res.status(500).json({ error: "Supabase 초기화 실패: " + e.message });
-    }
-
-    if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
-
-    try {
-        console.log("🚀 메인 로직 진입");
-
-// 환경변수 설정
+// 1. 환경변수 설정 (함수 밖에서 선언)
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 파일 용량 제한 설정 (10MB)
+// 2. Vercel 서버 설정 (파일 용량 제한 10MB)
 export const config = {
     api: {
         bodyParser: {
@@ -38,19 +17,24 @@ export const config = {
     },
 };
 
+// 3. 메인 API 핸들러
 export default async function handler(req, res) {
-    if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
+    // 디버깅 로그
+    console.log("🚀 API 호출됨: redact-document");
+
+    if (req.method !== 'POST') {
+        return res.status(405).json({ error: 'Method Not Allowed' });
+    }
 
     try {
         const { fileBase64, fileName, fileType } = req.body;
         if (!fileBase64) throw new Error("파일 데이터가 없습니다.");
 
         // ============================================================
-        // [핵심 수정] 병렬 처리 (Promise.all)
-        // Gemini 분석과 폰트 다운로드를 '동시에' 시작해서 시간을 절약합니다.
+        // [병렬 처리] Gemini 분석 & 폰트 다운로드 동시 실행
         // ============================================================
         
-        // 1. Gemini 분석 작업 정의
+        // Task A: Gemini 분석
         const analysisPromise = (async () => {
             const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
             const extractPrompt = `
@@ -75,15 +59,18 @@ export default async function handler(req, res) {
             return metaInfo;
         })();
 
-        // 2. 폰트 다운로드 작업 정의
-        const fontPromise = fetch('https://github.com/google/fonts/raw/main/ofl/notosanskr/NotoSansKR-Bold.otf')
-            .then(res => res.arrayBuffer());
+        // Task B: 한글 폰트 다운로드 (CDN 사용)
+        const fontPromise = fetch('https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosanskr/NotoSansKR-Bold.otf')
+            .then(res => {
+                if (!res.ok) throw new Error("폰트 다운로드 실패");
+                return res.arrayBuffer();
+            });
 
-        // 3. 두 작업이 다 끝날 때까지 기다림 (병렬 실행)
+        // 두 작업이 끝날 때까지 대기
         const [metaInfo, fontBytes] = await Promise.all([analysisPromise, fontPromise]);
 
         // ============================================================
-        // 4. PDF 비식별화 (Masking & Rewriting)
+        // [PDF 수정] 마스킹 & 다시 쓰기
         // ============================================================
         const pdfDoc = await PDFDocument.load(fileBase64);
         pdfDoc.registerFontkit(fontkit);
@@ -98,7 +85,7 @@ export default async function handler(req, res) {
             x: 0, y: height - 350, width: width, height: 350, color: rgb(1, 1, 1),
         });
 
-        // 다시 쓰기
+        // 텍스트 다시 쓰기
         let textY = height - 50;
         const fontSize = 12;
         
@@ -119,22 +106,24 @@ export default async function handler(req, res) {
         const pdfBytes = await pdfDoc.save();
 
         // ============================================================
-        // 5. Supabase 업로드
+        // [Supabase 업로드]
         // ============================================================
         const timestamp = new Date().getTime();
+        // 파일명 안전하게 변경 (한글 등 특수문자 제거)
         const safeName = `SECURE_${timestamp}_${fileName.replace(/[^a-zA-Z0-9.]/g, "_")}`;
 
         const { error: uploadError } = await supabase.storage
             .from('legal-docs')
             .upload(safeName, pdfBytes, {
-                contentType: 'application/pdf'
+                contentType: 'application/pdf',
+                upsert: true
             });
 
         if (uploadError) throw uploadError;
 
         const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/legal-docs/${safeName}`;
         
-        // 대기열 등록
+        // 대기열 등록 (document_queue)
         await supabase.from('document_queue').insert({
             filename: fileName,
             file_url: publicUrl,
