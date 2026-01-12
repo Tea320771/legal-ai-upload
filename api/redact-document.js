@@ -4,11 +4,11 @@ import fontkit from '@pdf-lib/fontkit';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
 
-// 1. 환경변수 설정 (함수 밖에서 선언)
+// 1. 환경변수 설정
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 2. Vercel 서버 설정 (파일 용량 제한 10MB)
+// 2. Vercel 서버 설정 (10MB 제한)
 export const config = {
     api: {
         bodyParser: {
@@ -19,7 +19,6 @@ export const config = {
 
 // 3. 메인 API 핸들러
 export default async function handler(req, res) {
-    // 디버깅 로그
     console.log("🚀 API 호출됨: redact-document");
 
     if (req.method !== 'POST') {
@@ -27,11 +26,22 @@ export default async function handler(req, res) {
     }
 
     try {
-        const { fileBase64, fileName, fileType } = req.body;
+        // let으로 선언 (내용을 수정해야 하므로)
+        let { fileBase64, fileName } = req.body;
+        
         if (!fileBase64) throw new Error("파일 데이터가 없습니다.");
 
         // ============================================================
-        // [병렬 처리] Gemini 분석 & 폰트 다운로드 동시 실행
+        // [핵심 수정] Base64 헤더 제거 (Gemini 에러 방지)
+        // 브라우저는 "data:application/pdf;base64,JVBER..." 형태로 보내는데,
+        // Gemini는 앞의 "data:...base64," 부분을 싫어합니다.
+        // ============================================================
+        if (fileBase64.includes("base64,")) {
+            fileBase64 = fileBase64.split("base64,")[1];
+        }
+
+        // ============================================================
+        // [병렬 처리] Gemini 분석 & 폰트 다운로드
         // ============================================================
         
         // Task A: Gemini 분석
@@ -59,18 +69,18 @@ export default async function handler(req, res) {
             return metaInfo;
         })();
 
-        // Task B: 한글 폰트 다운로드 (CDN 사용)
+        // Task B: 한글 폰트 다운로드
         const fontPromise = fetch('https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosanskr/NotoSansKR-Bold.otf')
             .then(res => {
                 if (!res.ok) throw new Error("폰트 다운로드 실패");
                 return res.arrayBuffer();
             });
 
-        // 두 작업이 끝날 때까지 대기
+        // 두 작업 동시 대기
         const [metaInfo, fontBytes] = await Promise.all([analysisPromise, fontPromise]);
 
         // ============================================================
-        // [PDF 수정] 마스킹 & 다시 쓰기
+        // [PDF 수정]
         // ============================================================
         const pdfDoc = await PDFDocument.load(fileBase64);
         pdfDoc.registerFontkit(fontkit);
@@ -80,7 +90,7 @@ export default async function handler(req, res) {
         const firstPage = pages[0];
         const { width, height } = firstPage.getSize();
         
-        // 마스킹 (상단 가리기)
+        // 마스킹
         firstPage.drawRectangle({
             x: 0, y: height - 350, width: width, height: 350, color: rgb(1, 1, 1),
         });
@@ -109,7 +119,6 @@ export default async function handler(req, res) {
         // [Supabase 업로드]
         // ============================================================
         const timestamp = new Date().getTime();
-        // 파일명 안전하게 변경 (한글 등 특수문자 제거)
         const safeName = `SECURE_${timestamp}_${fileName.replace(/[^a-zA-Z0-9.]/g, "_")}`;
 
         const { error: uploadError } = await supabase.storage
@@ -123,7 +132,6 @@ export default async function handler(req, res) {
 
         const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/legal-docs/${safeName}`;
         
-        // 대기열 등록 (document_queue)
         await supabase.from('document_queue').insert({
             filename: fileName,
             file_url: publicUrl,
