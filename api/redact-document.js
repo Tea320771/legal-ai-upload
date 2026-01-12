@@ -20,36 +20,49 @@ const MODELS_TO_TRY = [
 ];
 
 export default async function handler(req, res) {
-    console.log("🚀 API 호출됨: redact-document (Init Inside Handler)");
+    console.log("🚀 API 호출됨: redact-document (Diagnosis Mode)");
 
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
     try {
-        // [수정] 환경변수 및 클라이언트 초기화를 '함수 내부'로 이동
-        // 함수 밖에서 선언하면 Vercel Cold Start 시점에 환경변수를 못 읽을 수 있음
-        const apiKey = process.env.GEMINI_API_KEY;
-        const supabaseUrl = process.env.SUPABASE_URL;
-        const supabaseKey = process.env.SUPABASE_KEY;
+        // [중요] 환경변수 로드 및 '공백 제거(.trim())'
+        // 키 뒤에 숨어있는 엔터나 띄어쓰기를 없애줍니다.
+        const apiKey = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : "";
+        const supabaseUrl = process.env.SUPABASE_URL ? process.env.SUPABASE_URL.trim() : "";
+        const supabaseKey = process.env.SUPABASE_KEY ? process.env.SUPABASE_KEY.trim() : "";
 
-        if (!apiKey) throw new Error("GEMINI_API_KEY 환경변수가 없습니다.");
-        if (!supabaseUrl || !supabaseKey) throw new Error("Supabase 환경변수가 없습니다.");
+        if (!apiKey) throw new Error("GEMINI_API_KEY가 환경변수에 없습니다.");
+        
+        // 키가 정상적으로 들어왔는지 길이와 앞/뒤 문자 확인
+        console.log(`🔑 API Key 확인: 길이(${apiKey.length}), 시작(${apiKey.substring(0,4)}...), 끝(...${apiKey.substring(apiKey.length-4)})`);
 
         const genAI = new GoogleGenerativeAI(apiKey);
         const supabase = createClient(supabaseUrl, supabaseKey);
 
-        // -----------------------------------------------------------
-        
         let { fileBase64, fileName } = req.body;
         if (!fileBase64) throw new Error("파일 데이터가 없습니다.");
 
-        // Base64 정제
         let cleanBase64 = fileBase64;
-        if (cleanBase64.includes("base64,")) {
-            cleanBase64 = cleanBase64.split("base64,")[1];
-        }
+        if (cleanBase64.includes("base64,")) cleanBase64 = cleanBase64.split("base64,")[1];
         cleanBase64 = cleanBase64.replace(/[\r\n\s]/g, '');
 
-        console.log(`📄 데이터 준비 완료 (키: ${apiKey.substring(0,4)}***)`);
+        // ============================================================
+        // [진단 Task] 사용 가능한 모델 목록 조회 (List Models)
+        // 이 함수가 성공하면 키는 정상입니다. 여기서 실패하면 키/권한 문제입니다.
+        // ============================================================
+        try {
+            console.log("🔍 API 권한 확인 중 (List Models)...");
+            // API 키로 접근 가능한 모델 리스트를 요청해봅니다.
+            // (SDK 버전에 따라 listModels가 없을 수도 있어 getGenerativeModel로 대체 테스트)
+            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+            await model.generateContent("Test"); 
+            console.log("✅ API 키 권한 정상 확인됨 (기본 모델 통신 성공)");
+        } catch (e) {
+            console.error("❌ API 키 권한 오류 발생!");
+            console.error("에러 내용:", e.message);
+            console.error("👉 조치 방법: Google Cloud Console에서 'Generative Language API'가 Enable 되어 있는지 확인하세요.");
+            // 여기서 에러가 나도 일단 진행해봅니다.
+        }
 
         // ============================================================
         // [Task A] 폰트 다운로드
@@ -61,7 +74,7 @@ export default async function handler(req, res) {
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 return { fontData: await response.arrayBuffer(), type: 'custom' };
             } catch (e) {
-                console.error("⚠️ 폰트 다운로드 실패:", e.message);
+                console.error("⚠️ 폰트 실패 (기본 폰트 사용):", e.message);
                 return { fontData: null, type: 'standard' };
             }
         };
@@ -70,18 +83,9 @@ export default async function handler(req, res) {
         // [Task B] AI 분석
         // ============================================================
         const analyzeDoc = async () => {
-            // Ping Test
-            try {
-                const testModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-                await testModel.generateContent("Hello");
-                console.log("✅ API 키 연결 테스트 성공");
-            } catch (e) {
-                console.warn("⚠️ API 키 연결 테스트 실패 (무시하고 계속 진행):", e.message);
-            }
-
             for (const modelName of MODELS_TO_TRY) {
                 try {
-                    console.log(`🤖 AI 분석 시도: ${modelName}`);
+                    console.log(`🤖 모델 시도: ${modelName}`);
                     
                     const model = genAI.getGenerativeModel({ 
                         model: modelName,
@@ -89,19 +93,17 @@ export default async function handler(req, res) {
                     });
 
                     const result = await model.generateContent({
-                        contents: [
-                            {
-                                role: "user",
-                                parts: [
-                                    { text: "이 문서의 법원명, 사건번호, 원고/피고, 대리인 이름을 JSON으로 추출해. { \"court\": \"...\", \"caseNo\": \"...\", \"parties\": \"...\", \"lawyer\": \"...\" }" },
-                                    { inlineData: { data: cleanBase64, mimeType: "application/pdf" } }
-                                ]
-                            }
-                        ]
+                        contents: [{
+                            role: "user",
+                            parts: [
+                                { text: "이 문서의 법원명, 사건번호, 원고/피고, 대리인 이름을 JSON으로 추출해. {\"court\":\"...\", \"caseNo\":\"...\", \"parties\":\"...\", \"lawyer\":\"...\"}" },
+                                { inlineData: { data: cleanBase64, mimeType: "application/pdf" } }
+                            ]
+                        }]
                     });
                     
                     let text = result.response.text().replace(/```json/g, "").replace(/```/g, "").trim();
-                    console.log(`✅ AI 분석 성공 (${modelName})`);
+                    console.log(`✅ 성공 (${modelName})`);
                     return JSON.parse(text);
 
                 } catch (e) {
@@ -109,7 +111,7 @@ export default async function handler(req, res) {
                     continue;
                 }
             }
-            console.error("❌ 모든 AI 모델 실패");
+            console.error("❌ 모든 모델 실패");
             return { court: "분석실패", caseNo: "정보없음", parties: "", lawyer: "" };
         };
 
@@ -121,24 +123,20 @@ export default async function handler(req, res) {
         const pdfDoc = await PDFDocument.load(cleanBase64);
         pdfDoc.registerFontkit(fontkit);
 
-        let useFont;
-        if (fontResult.type === 'custom') {
-            useFont = await pdfDoc.embedFont(fontResult.fontData);
-        } else {
-            useFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
-        }
+        let useFont = fontResult.type === 'custom' 
+            ? await pdfDoc.embedFont(fontResult.fontData) 
+            : await pdfDoc.embedFont(StandardFonts.Helvetica);
 
         const pages = pdfDoc.getPages();
         const firstPage = pages[0];
         const { width, height } = firstPage.getSize();
 
-        // 마스킹
         firstPage.drawRectangle({ x: 0, y: height - 350, width: width, height: 350, color: rgb(1, 1, 1) });
         
         let textY = height - 50;
         const fontSize = 12;
-        
         const title = fontResult.type === 'custom' ? "🔒 [보안 처리된 문서]" : "SECURE DOCUMENT";
+        
         firstPage.drawText(title, { x: 50, y: textY, size: 16, font: useFont, color: rgb(0, 0.5, 0) });
         textY -= 40;
 
@@ -155,11 +153,10 @@ export default async function handler(req, res) {
 
         const pdfBytes = await pdfDoc.save();
 
-        // 업로드
         const timestamp = new Date().getTime();
         const safeName = `SECURE_${timestamp}_${fileName.replace(/[^a-zA-Z0-9.]/g, "_")}`;
-
         const { error: uploadError } = await supabase.storage.from('legal-docs').upload(safeName, pdfBytes, { contentType: 'application/pdf', upsert: true });
+
         if (uploadError) throw uploadError;
 
         const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/legal-docs/${safeName}`;
