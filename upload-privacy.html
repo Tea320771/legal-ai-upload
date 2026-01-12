@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>비식별화 보안 업로드 (Privacy Upload)</title>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <style>
+        body { font-family: 'Pretendard', sans-serif; padding: 40px; background: #f8fafc; color: #334155; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        h1 { margin-top: 0; color: #0f172a; }
+        
+        .upload-area { border: 2px dashed #cbd5e1; padding: 40px; text-align: center; border-radius: 8px; background: #f1f5f9; cursor: pointer; transition: 0.2s; margin-bottom: 20px; }
+        .upload-area:hover { border-color: #3b82f6; background: #eff6ff; }
+        
+        .file-list { margin-top: 20px; }
+        .file-item { display: flex; justify-content: space-between; align-items: center; padding: 15px; background: #fff; border: 1px solid #e2e8f0; margin-bottom: 10px; border-radius: 6px; }
+        
+        .status { font-size: 0.85rem; font-weight: bold; padding: 4px 8px; border-radius: 4px; }
+        .status.waiting { background: #e2e8f0; color: #64748b; }
+        .status.processing { background: #dbeafe; color: #2563eb; } /* 파란색: 처리중 */
+        .status.uploading { background: #fef3c7; color: #d97706; } /* 노란색: 업로드중 */
+        .status.done { background: #dcfce7; color: #166534; }       /* 초록색: 완료 */
+        .status.error { background: #fee2e2; color: #dc2626; }      /* 빨간색: 에러 */
+
+        .btn { background: #0f172a; color: white; border: none; padding: 15px; border-radius: 6px; font-weight: bold; cursor: pointer; width: 100%; margin-top: 20px; font-size: 1rem; }
+        .btn:disabled { background: #94a3b8; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🛡️ 판결문 보안 처리 및 업로드</h1>
+    <p style="color:#64748b; margin-bottom:30px;">
+        1. AI가 판결문의 <b>[법원/사건번호/대리인]</b> 정보를 추출합니다.<br>
+        2. 상단 개인정보 영역을 <b>하얗게 가리고(Masking)</b> 추출한 정보를 다시 기재합니다.<br>
+        3. 보안 처리된 파일을 <b>Supabase</b>에 저장합니다.
+    </p>
+
+    <input type="file" id="fileInput" multiple accept=".pdf" style="display:none">
+    <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+        <div style="font-size: 3rem; margin-bottom: 10px;">📂</div>
+        <h3 style="margin: 0;">판결문 PDF 파일을 이곳에 놓으세요</h3>
+        <p style="font-size: 0.9rem; color: #64748b;">(여러 개 동시 선택 가능)</p>
+    </div>
+
+    <div id="fileList" class="file-list"></div>
+    <button id="btnProcess" class="btn" style="display:none;" onclick="processAndUploadFiles()">
+        🚀 보안 처리 및 업로드 시작
+    </button>
+</div>
+
+<script>
+    // [중요] 이제 여기에 Supabase 키를 적을 필요가 없습니다! (보안 강화)
+
+    const fileInput = document.getElementById('fileInput');
+    const fileListEl = document.getElementById('fileList');
+    const btnProcess = document.getElementById('btnProcess');
+    let selectedFiles = [];
+
+    fileInput.addEventListener('change', (e) => {
+        if (e.target.files.length > 0) {
+            selectedFiles = Array.from(e.target.files);
+            renderFileList();
+            btnProcess.style.display = 'block';
+        }
+    });
+
+    function renderFileList() {
+        fileListEl.innerHTML = '';
+        selectedFiles.forEach((file, index) => {
+            fileListEl.innerHTML += `
+                <div class="file-item">
+                    <strong>${file.name}</strong>
+                    <span id="status-${index}" class="status waiting">대기 중</span>
+                </div>`;
+        });
+    }
+
+    function updateStatus(index, text, type) {
+        const el = document.getElementById(`status-${index}`);
+        el.innerText = text;
+        el.className = `status ${type}`;
+    }
+
+    // 메인 로직: 파일을 서버로 전송 (업로드는 서버가 알아서 함)
+    async function processAndUploadFiles() {
+        btnProcess.disabled = true;
+        btnProcess.innerText = "서버에서 처리 중...";
+
+        for (let i = 0; i < selectedFiles.length; i++) {
+            const file = selectedFiles[i];
+            updateStatus(i, "📡 서버 전송 및 처리 중...", "processing");
+
+            try {
+                // 1. 파일을 Base64로 변환
+                const reader = new FileReader();
+                const base64Promise = new Promise(resolve => {
+                    reader.onload = (e) => resolve(e.target.result);
+                    reader.readAsDataURL(file);
+                });
+                const base64 = await base64Promise;
+
+                // 2. API 호출 (파일명도 같이 보냄)
+                const response = await fetch('/api/redact-document', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        fileBase64: base64, 
+                        fileName: file.name, // [추가] 파일명 전송
+                        fileType: file.type 
+                    })
+                });
+
+                const result = await response.json();
+                if (!result.success) throw new Error(result.error || "처리 실패");
+
+                // 3. 완료 처리
+                updateStatus(i, `✅ 저장 완료 (${result.extractedMeta.court || '완료'})`, "done");
+
+            } catch (e) {
+                console.error(e);
+                updateStatus(i, "❌ 실패: " + e.message, "error");
+            }
+        }
+
+        btnProcess.disabled = false;
+        btnProcess.innerText = "모든 작업 완료";
+        alert("모든 파일이 안전하게 서버에 저장되었습니다.");
+    }
+</script>
+
+</body>
+</html>
