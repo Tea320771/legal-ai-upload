@@ -41,7 +41,7 @@ function wordWrap(text, maxWidth, font, fontSize) {
 }
 
 export default async function handler(req, res) {
-    console.log("🚀 API 호출됨: redact-document (Fix DB Filename)");
+    console.log("🚀 API 호출됨: redact-document (RealName Lawyer Fix)");
 
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
@@ -86,16 +86,31 @@ export default async function handler(req, res) {
                         generationConfig: { responseMimeType: "application/json" }
                     });
 
+                    // [수정된 프롬프트] 변호사/법무법인 실명 유지 강조
                     const extractPrompt = `
                     You are a legal document anonymizer. Analyze this judgment PDF.
-                    1. **Mapping**: Identify all parties (Plaintiffs, Defendants, Intervenors). Assign pseudonyms.
-                    2. **Rewrite Sections**: Rewrite "Order" and "Claim" replacing real names with pseudonyms.
-                    3. **Masking Range**: Find where the header/body ends. Return "maskEndPage" (1-based) and "maskEndRatio".
+
+                    1. **Mapping (Parties)**: 
+                       - Identify Plaintiffs, Defendants, Intervenors. 
+                       - Assign pseudonyms (e.g., "원고 A", "피고 B").
+                    
+                    2. **Mapping (Lawyers)**:
+                       - Identify Law Firms (법무법인) and Lawyers (변호사).
+                       - **CRITICAL**: Do NOT anonymize them. Keep their **REAL NAMES** exactly as they appear.
+                       - List who they represent using the party's pseudonym (e.g., "법무법인 태평양 (원고 A 대리)").
+
+                    3. **Rewrite Sections**: 
+                       - Rewrite "Order" (주문) and "Claim" (청구취지).
+                       - Replace ONLY the names of Plaintiffs/Defendants/Intervenors with pseudonyms.
+                       - Keep Law Firms/Lawyers/Dates/Amounts/Court Names as **REAL VALUES**.
+
+                    4. **Masking Range**: Find where the header/body ends. Return "maskEndPage" (1-based) and "maskEndRatio".
 
                     Output JSON:
                     {
                         "court": "string", "caseNo": "string", 
-                        "parties_anonymized": "string", "lawyer_info": "string",
+                        "parties_anonymized": "string (Pseudonyms)", 
+                        "lawyer_info": "string (REAL NAMES of firms/lawyers)",
                         "order_anonymized": "string", "claim_anonymized": "string",
                         "maskEndPage": number, "maskEndRatio": number
                     }
@@ -182,7 +197,7 @@ export default async function handler(req, res) {
         drawField("법원", metaInfo.court);
         drawField("사건", metaInfo.caseNo);
         drawField("당사자(가명)", metaInfo.parties_anonymized);
-        drawField("대리인", metaInfo.lawyer_info);
+        drawField("대리인(실명)", metaInfo.lawyer_info); // 라벨도 명확하게 변경
         textY -= 10;
         firstPage.drawText("[주 문 (가명 처리)]", { x: 50, y: textY, size: 12, font: useFont, color: rgb(0, 0, 0) });
         textY -= 20;
@@ -194,7 +209,7 @@ export default async function handler(req, res) {
 
         const pdfBytes = await pdfDoc.save();
 
-        // [Task D] 업로드 (파일명 수정)
+        // [Task D] 업로드
         const timestamp = new Date().getTime();
         const safeName = `SECURE_${timestamp}_${fileName.replace(/[^a-zA-Z0-9.]/g, "_")}`;
 
@@ -203,10 +218,8 @@ export default async function handler(req, res) {
 
         const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/legal-docs/${safeName}`;
         
-        // [중요 수정] filename 컬럼에 safeName(실제 저장된 이름)을 저장합니다.
-        // 그래야 check-new-docs.js가 해당 파일을 찾아서 다운로드할 수 있습니다.
         await supabase.from('document_queue').insert({
-            filename: safeName,  // <-- 수정됨 (fileName -> safeName)
+            filename: safeName, 
             file_url: publicUrl,
             status: 'pending',
             ai_result: {}
