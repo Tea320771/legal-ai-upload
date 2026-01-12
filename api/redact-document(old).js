@@ -19,7 +19,7 @@ const MODELS_TO_TRY = [
     "gemini-pro-latest"
 ];
 
-// 텍스트 줄바꿈 계산 함수
+// 텍스트 줄바꿈 계산 함수 (간단 구현)
 function wordWrap(text, maxWidth, font, fontSize) {
     if (!text) return [];
     const words = text.replace(/\n/g, ' ').split(' ');
@@ -41,7 +41,7 @@ function wordWrap(text, maxWidth, font, fontSize) {
 }
 
 export default async function handler(req, res) {
-    console.log("🚀 API 호출됨: redact-document (Fix DB Filename)");
+    console.log("🚀 API 호출됨: redact-document (Anonymization & Rewrite)");
 
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
@@ -64,7 +64,9 @@ export default async function handler(req, res) {
 
         console.log(`📄 데이터 준비 완료 (${fileName})`);
 
-        // [Task A] 폰트 다운로드
+        // ============================================================
+        // [Task A] 폰트 다운로드 (나눔고딕)
+        // ============================================================
         const loadFont = async () => {
             try {
                 const fontUrl = 'https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Bold.ttf';
@@ -77,10 +79,14 @@ export default async function handler(req, res) {
             }
         };
 
-        // [Task B] AI 분석
+        // ============================================================
+        // [Task B] AI 분석 (가명 처리 및 섹션 위치 추적)
+        // ============================================================
         const analyzeDoc = async () => {
             for (const modelName of MODELS_TO_TRY) {
                 try {
+                    console.log(`🤖 AI 분석 시도: ${modelName}`);
+                    
                     const model = genAI.getGenerativeModel({ 
                         model: modelName,
                         generationConfig: { responseMimeType: "application/json" }
@@ -88,16 +94,31 @@ export default async function handler(req, res) {
 
                     const extractPrompt = `
                     You are a legal document anonymizer. Analyze this judgment PDF.
-                    1. **Mapping**: Identify all parties (Plaintiffs, Defendants, Intervenors). Assign pseudonyms.
-                    2. **Rewrite Sections**: Rewrite "Order" and "Claim" replacing real names with pseudonyms.
-                    3. **Masking Range**: Find where the header/body ends. Return "maskEndPage" (1-based) and "maskEndRatio".
+
+                    1. **Mapping**: Identify all parties (Plaintiffs, Defendants, Intervenors). 
+                       - Assign pseudonyms (e.g., "원고 A", "피고 B", "참가인 C").
+                       - Identify Lawyers and map them to whom they represent (e.g., "Lawyer Kim (for Plaintiff A)").
+
+                    2. **Rewrite Sections**:
+                       - "Order" (주문): Rewrite the full text, replacing real names with assigned pseudonyms.
+                       - "Claim" (청구취지): Rewrite the full text, replacing real names with assigned pseudonyms.
+                       - "PartiesInfo": A formatted string listing pseudonyms (e.g., "원고 A, 피고 B").
+                    
+                    3. **Masking Range**:
+                       - Find the end of the "Claim" (청구취지) section. If not present, find the end of "Order" (주문).
+                       - Return "maskEndPage" (page number, 1-based) and "maskEndRatio" (0.0 to 1.0) where the sensitive header + order + claim section ends.
+                       - Example: If Claim ends at the middle of Page 2, maskEndPage=2, maskEndRatio=0.5.
 
                     Output JSON:
                     {
-                        "court": "string", "caseNo": "string", 
-                        "parties_anonymized": "string", "lawyer_info": "string",
-                        "order_anonymized": "string", "claim_anonymized": "string",
-                        "maskEndPage": number, "maskEndRatio": number
+                        "court": "Court Name",
+                        "caseNo": "Case Number",
+                        "parties_anonymized": "String listing anonymized parties",
+                        "lawyer_info": "String listing Lawyers and who they represent",
+                        "order_anonymized": "Full text of Order with pseudonyms",
+                        "claim_anonymized": "Full text of Claim with pseudonyms",
+                        "maskEndPage": number,
+                        "maskEndRatio": number
                     }
                     `;
 
@@ -112,20 +133,28 @@ export default async function handler(req, res) {
                     });
                     
                     let text = result.response.text().replace(/```json/g, "").replace(/```/g, "").trim();
+                    console.log(`✅ AI 분석 성공 (${modelName})`);
                     return JSON.parse(text);
+
                 } catch (e) {
+                    console.warn(`⚠️ ${modelName} 실패: ${e.message}`);
                     continue;
                 }
             }
+            // 실패 시 기본값
             return { 
-                court: "분석실패", caseNo: "정보없음", parties_anonymized: "정보없음", lawyer_info: "정보없음",
-                order_anonymized: "내용 없음", claim_anonymized: "내용 없음", maskEndPage: 1, maskEndRatio: 0.5 
+                court: "분석실패", caseNo: "정보없음", 
+                parties_anonymized: "정보없음", lawyer_info: "정보없음",
+                order_anonymized: "내용 없음", claim_anonymized: "내용 없음",
+                maskEndPage: 1, maskEndRatio: 0.5 
             };
         };
 
         const [fontResult, metaInfo] = await Promise.all([loadFont(), analyzeDoc()]);
 
-        // [Task C] PDF 수정
+        // ============================================================
+        // [Task C] PDF 수정 (마스킹 & 가명 텍스트 기재)
+        // ============================================================
         const pdfDoc = await PDFDocument.load(cleanBase64);
         pdfDoc.registerFontkit(fontkit);
 
@@ -137,56 +166,78 @@ export default async function handler(req, res) {
         }
 
         const pages = pdfDoc.getPages();
+        
+        // 1. 마스킹 범위 적용
+        // 주문/청구취지가 끝나는 지점까지 싹 다 가립니다.
         let endPageIdx = (metaInfo.maskEndPage || 1) - 1; 
         let endRatio = metaInfo.maskEndRatio;
+        
         if (typeof endRatio !== 'number') endRatio = 0.6;
-        endRatio = Math.min(endRatio + 0.05, 1.0);
+        endRatio = Math.min(endRatio + 0.05, 1.0); // 여유 공간
 
         for (let i = 0; i < pages.length; i++) {
             const page = pages[i];
             const { width, height } = page.getSize();
+
             if (i < endPageIdx) {
+                // 이전 페이지들은 전체 마스킹
                 page.drawRectangle({ x: 0, y: 0, width: width, height: height, color: rgb(1, 1, 1) });
-            } else if (i === endPageIdx) {
+            } 
+            else if (i === endPageIdx) {
+                // 타겟 페이지는 비율만큼 마스킹
                 const maskHeight = height * endRatio;
-                page.drawRectangle({ x: 0, y: height - maskHeight, width: width, height: maskHeight, color: rgb(1, 1, 1) });
+                page.drawRectangle({
+                    x: 0, y: height - maskHeight, width: width, height: maskHeight, color: rgb(1, 1, 1)
+                });
                 break;
             }
         }
         
+        // 2. 가명 정보 기재 (첫 페이지)
         const firstPage = pages[0];
         const { width, height } = firstPage.getSize();
-        const fontSize = 11;
+        const fontSize = 11; // 폰트 사이즈 조절
         const lineHeight = 16;
         let textY = height - 50;
 
+        // 제목
         firstPage.drawText("🔒 [보안 처리된 문서 - 가명 처리]", { x: 50, y: textY, size: 14, font: useFont, color: rgb(0, 0.5, 0) });
         textY -= 30;
 
+        // 텍스트 출력 헬퍼 (자동 줄바꿈)
         const drawField = (label, content) => {
             const labelWidth = useFont.widthOfTextAtSize(label + ": ", fontSize);
             firstPage.drawText(label + ":", { x: 50, y: textY, size: fontSize, font: useFont, color: rgb(0, 0, 0) });
+            
+            // 내용 줄바꿈 계산 (여백 고려)
             const maxContentWidth = width - 100 - labelWidth;
             const lines = wordWrap(content || "정보없음", maxContentWidth, useFont, fontSize);
+
+            // 첫 줄은 라벨 옆에, 나머지는 들여쓰기
             if (lines.length > 0) {
                 firstPage.drawText(lines[0], { x: 50 + labelWidth, y: textY, size: fontSize, font: useFont, color: rgb(0.2, 0.2, 0.2) });
                 textY -= lineHeight;
+                
                 for (let i = 1; i < lines.length; i++) {
                     firstPage.drawText(lines[i], { x: 50 + labelWidth, y: textY, size: fontSize, font: useFont, color: rgb(0.2, 0.2, 0.2) });
                     textY -= lineHeight;
                 }
-            } else { textY -= lineHeight; }
-            textY -= 5;
+            } else {
+                textY -= lineHeight;
+            }
+            textY -= 5; // 항목 간 간격
         };
 
         drawField("법원", metaInfo.court);
         drawField("사건", metaInfo.caseNo);
         drawField("당사자(가명)", metaInfo.parties_anonymized);
         drawField("대리인", metaInfo.lawyer_info);
+        
         textY -= 10;
         firstPage.drawText("[주 문 (가명 처리)]", { x: 50, y: textY, size: 12, font: useFont, color: rgb(0, 0, 0) });
         textY -= 20;
         drawField("", metaInfo.order_anonymized);
+
         textY -= 10;
         firstPage.drawText("[청구 취지 (가명 처리)]", { x: 50, y: textY, size: 12, font: useFont, color: rgb(0, 0, 0) });
         textY -= 20;
@@ -194,23 +245,18 @@ export default async function handler(req, res) {
 
         const pdfBytes = await pdfDoc.save();
 
-        // [Task D] 업로드 (파일명 수정)
+        // ============================================================
+        // [Task D] 업로드
+        // ============================================================
         const timestamp = new Date().getTime();
         const safeName = `SECURE_${timestamp}_${fileName.replace(/[^a-zA-Z0-9.]/g, "_")}`;
 
         const { error: uploadError } = await supabase.storage.from('legal-docs').upload(safeName, pdfBytes, { contentType: 'application/pdf', upsert: true });
+
         if (uploadError) throw uploadError;
 
         const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/legal-docs/${safeName}`;
-        
-        // [중요 수정] filename 컬럼에 safeName(실제 저장된 이름)을 저장합니다.
-        // 그래야 check-new-docs.js가 해당 파일을 찾아서 다운로드할 수 있습니다.
-        await supabase.from('document_queue').insert({
-            filename: safeName,  // <-- 수정됨 (fileName -> safeName)
-            file_url: publicUrl,
-            status: 'pending',
-            ai_result: {}
-        });
+        await supabase.from('document_queue').insert({ filename: fileName, file_url: publicUrl, status: 'pending', ai_result: {} });
 
         return res.status(200).json({ success: true, message: "완료", fileUrl: publicUrl, extractedMeta: metaInfo });
 
