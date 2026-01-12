@@ -12,7 +12,6 @@ export const config = {
     },
 };
 
-// 최신 모델 목록 유지
 const MODELS_TO_TRY = [
     "gemini-2.0-flash",
     "gemini-2.5-flash",
@@ -20,8 +19,29 @@ const MODELS_TO_TRY = [
     "gemini-pro-latest"
 ];
 
+// 텍스트 줄바꿈 계산 함수 (간단 구현)
+function wordWrap(text, maxWidth, font, fontSize) {
+    if (!text) return [];
+    const words = text.replace(/\n/g, ' ').split(' ');
+    let lines = [];
+    let currentLine = words[0];
+
+    for (let i = 1; i < words.length; i++) {
+        const word = words[i];
+        const width = font.widthOfTextAtSize(currentLine + " " + word, fontSize);
+        if (width < maxWidth) {
+            currentLine += " " + word;
+        } else {
+            lines.push(currentLine);
+            currentLine = word;
+        }
+    }
+    lines.push(currentLine);
+    return lines;
+}
+
 export default async function handler(req, res) {
-    console.log("🚀 API 호출됨: redact-document (Multi-page Masking)");
+    console.log("🚀 API 호출됨: redact-document (Anonymization & Rewrite)");
 
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
@@ -60,7 +80,7 @@ export default async function handler(req, res) {
         };
 
         // ============================================================
-        // [Task B] AI 분석 (페이지 넘김 추적)
+        // [Task B] AI 분석 (가명 처리 및 섹션 위치 추적)
         // ============================================================
         const analyzeDoc = async () => {
             for (const modelName of MODELS_TO_TRY) {
@@ -72,30 +92,33 @@ export default async function handler(req, res) {
                         generationConfig: { responseMimeType: "application/json" }
                     });
 
-                    // [핵심] 페이지 번호(bodyStartPage)까지 요구하는 프롬프트
                     const extractPrompt = `
-                    You are a legal document redactor. The document contains personal information (Parties) at the beginning, followed by the main judgment body.
+                    You are a legal document anonymizer. Analyze this judgment PDF.
+
+                    1. **Mapping**: Identify all parties (Plaintiffs, Defendants, Intervenors). 
+                       - Assign pseudonyms (e.g., "원고 A", "피고 B", "참가인 C").
+                       - Identify Lawyers and map them to whom they represent (e.g., "Lawyer Kim (for Plaintiff A)").
+
+                    2. **Rewrite Sections**:
+                       - "Order" (주문): Rewrite the full text, replacing real names with assigned pseudonyms.
+                       - "Claim" (청구취지): Rewrite the full text, replacing real names with assigned pseudonyms.
+                       - "PartiesInfo": A formatted string listing pseudonyms (e.g., "원고 A, 피고 B").
                     
-                    1. **Extract Meta Info**:
-                       - "court": Court name.
-                       - "caseNo": Case number.
-                       - "parties": Names of Plaintiffs(원고), Defendants(피고), AND Intervenors(보조참가인, 독립당사자참가인). Combine them into a single string.
-                       - "lawyer": Legal representatives.
+                    3. **Masking Range**:
+                       - Find the end of the "Claim" (청구취지) section. If not present, find the end of "Order" (주문).
+                       - Return "maskEndPage" (page number, 1-based) and "maskEndRatio" (0.0 to 1.0) where the sensitive header + order + claim section ends.
+                       - Example: If Claim ends at the middle of Page 2, maskEndPage=2, maskEndRatio=0.5.
 
-                    2. **Locate Body Start**:
-                       - Find where the header ends and the body begins. Look for keywords: "변론 종결", "판결 선고", "주 문", "청구 취지".
-                       - Identify the **Page Number** (1-based) where this keyword first appears. -> "bodyStartPage"
-                       - Identify the **Vertical Position** (ratio 0.0 to 1.0) on that specific page. -> "bodyStartRatio"
-                       - (Example: If "변론 종결" is at the top of Page 2, bodyStartPage=2, bodyStartRatio=0.1)
-
-                    Output JSON only:
+                    Output JSON:
                     {
-                        "court": "string",
-                        "caseNo": "string",
-                        "parties": "string",
-                        "lawyer": "string",
-                        "bodyStartPage": number,
-                        "bodyStartRatio": number
+                        "court": "Court Name",
+                        "caseNo": "Case Number",
+                        "parties_anonymized": "String listing anonymized parties",
+                        "lawyer_info": "String listing Lawyers and who they represent",
+                        "order_anonymized": "Full text of Order with pseudonyms",
+                        "claim_anonymized": "Full text of Claim with pseudonyms",
+                        "maskEndPage": number,
+                        "maskEndRatio": number
                     }
                     `;
 
@@ -118,15 +141,19 @@ export default async function handler(req, res) {
                     continue;
                 }
             }
-            console.error("❌ 모든 AI 모델 실패");
-            // 실패 시 안전하게 1페이지의 절반만 가림 (Fallback)
-            return { court: "분석실패", caseNo: "정보없음", parties: "", lawyer: "", bodyStartPage: 1, bodyStartRatio: 0.5 };
+            // 실패 시 기본값
+            return { 
+                court: "분석실패", caseNo: "정보없음", 
+                parties_anonymized: "정보없음", lawyer_info: "정보없음",
+                order_anonymized: "내용 없음", claim_anonymized: "내용 없음",
+                maskEndPage: 1, maskEndRatio: 0.5 
+            };
         };
 
         const [fontResult, metaInfo] = await Promise.all([loadFont(), analyzeDoc()]);
 
         // ============================================================
-        // [Task C] PDF 수정 (다중 페이지 마스킹)
+        // [Task C] PDF 수정 (마스킹 & 가명 텍스트 기재)
         // ============================================================
         const pdfDoc = await PDFDocument.load(cleanBase64);
         pdfDoc.registerFontkit(fontkit);
@@ -140,84 +167,81 @@ export default async function handler(req, res) {
 
         const pages = pdfDoc.getPages();
         
-        // 1. 마스킹 위치 계산
-        // AI가 페이지를 못 찾았거나 이상한 값이면 안전하게 1페이지로 설정
-        let startPageIdx = (metaInfo.bodyStartPage || 1) - 1; 
-        let startRatio = metaInfo.bodyStartRatio;
+        // 1. 마스킹 범위 적용
+        // 주문/청구취지가 끝나는 지점까지 싹 다 가립니다.
+        let endPageIdx = (metaInfo.maskEndPage || 1) - 1; 
+        let endRatio = metaInfo.maskEndRatio;
         
-        if (startPageIdx < 0) startPageIdx = 0;
-        if (typeof startRatio !== 'number') startRatio = 0.5;
+        if (typeof endRatio !== 'number') endRatio = 0.6;
+        endRatio = Math.min(endRatio + 0.05, 1.0); // 여유 공간
 
-        // 약간의 여유(Margin)를 둬서 글자가 잘리지 않게 함
-        // 비율이 0.1(상단)이면 -> 0.15까지 가림
-        // 비율이 0.9(하단)이면 -> 0.95까지 가림
-        startRatio = Math.min(startRatio + 0.05, 1.0);
-
-        console.log(`📏 마스킹 범위: ${startPageIdx + 1}페이지의 ${Math.round(startRatio * 100)}% 지점까지`);
-
-        // 2. 페이지 순회하며 마스킹
         for (let i = 0; i < pages.length; i++) {
             const page = pages[i];
             const { width, height } = page.getSize();
 
-            if (i < startPageIdx) {
-                // [이전 페이지] 본문 시작 전 페이지이므로 "전체 마스킹"
-                // 예: 2페이지가 본문 시작이면, 1페이지는 싹 다 가림
-                page.drawRectangle({
-                    x: 0, y: 0, width: width, height: height,
-                    color: rgb(1, 1, 1),
-                });
-                console.log(`   -> Page ${i + 1}: 전체 마스킹 (헤더가 넘어감)`);
+            if (i < endPageIdx) {
+                // 이전 페이지들은 전체 마스킹
+                page.drawRectangle({ x: 0, y: 0, width: width, height: height, color: rgb(1, 1, 1) });
             } 
-            else if (i === startPageIdx) {
-                // [타겟 페이지] 본문이 시작되는 페이지이므로 "비율만큼 마스킹"
-                const maskHeight = height * startRatio;
+            else if (i === endPageIdx) {
+                // 타겟 페이지는 비율만큼 마스킹
+                const maskHeight = height * endRatio;
                 page.drawRectangle({
-                    x: 0,
-                    y: height - maskHeight,
-                    width: width,
-                    height: maskHeight,
-                    color: rgb(1, 1, 1),
+                    x: 0, y: height - maskHeight, width: width, height: maskHeight, color: rgb(1, 1, 1)
                 });
-                console.log(`   -> Page ${i + 1}: 상단 ${Math.round(startRatio * 100)}% 마스킹`);
-                
-                // 마스킹이 끝나는 페이지에서 루프 종료 (뒤쪽 본문은 건드리지 않음)
                 break;
             }
         }
         
-        // ============================================================
-        // 3. 추출 정보 기재 (첫 페이지에만 작성)
-        // ============================================================
+        // 2. 가명 정보 기재 (첫 페이지)
         const firstPage = pages[0];
-        const { width: p1Width, height: p1Height } = firstPage.getSize();
-        
-        let textY = p1Height - 50;
-        const fontSize = 12;
-        
-        const title = fontResult.type === 'custom' ? "🔒 [보안 처리된 문서]" : "SECURE DOCUMENT";
-        firstPage.drawText(title, { x: 50, y: textY, size: 16, font: useFont, color: rgb(0, 0.5, 0) });
-        textY -= 40;
+        const { width, height } = firstPage.getSize();
+        const fontSize = 11; // 폰트 사이즈 조절
+        const lineHeight = 16;
+        let textY = height - 50;
 
-        const safeDraw = (label, value) => {
-            const valStr = value || '정보없음';
-            // 줄바꿈 제거 (한 줄로 출력하기 위해)
-            const cleanVal = valStr.replace(/[\r\n]+/g, " "); 
-            const text = fontResult.type === 'custom' ? `${label}: ${cleanVal}` : `${label}: ${cleanVal}`;
+        // 제목
+        firstPage.drawText("🔒 [보안 처리된 문서 - 가명 처리]", { x: 50, y: textY, size: 14, font: useFont, color: rgb(0, 0.5, 0) });
+        textY -= 30;
+
+        // 텍스트 출력 헬퍼 (자동 줄바꿈)
+        const drawField = (label, content) => {
+            const labelWidth = useFont.widthOfTextAtSize(label + ": ", fontSize);
+            firstPage.drawText(label + ":", { x: 50, y: textY, size: fontSize, font: useFont, color: rgb(0, 0, 0) });
             
-            // 너무 길면 자르기
-            const maxLength = 70;
-            const displayStr = text.length > maxLength ? text.substring(0, maxLength) + "..." : text;
-            
-            firstPage.drawText(displayStr, { x: 50, y: textY, size: fontSize, font: useFont, color: rgb(0, 0, 0) });
-            textY -= 20;
+            // 내용 줄바꿈 계산 (여백 고려)
+            const maxContentWidth = width - 100 - labelWidth;
+            const lines = wordWrap(content || "정보없음", maxContentWidth, useFont, fontSize);
+
+            // 첫 줄은 라벨 옆에, 나머지는 들여쓰기
+            if (lines.length > 0) {
+                firstPage.drawText(lines[0], { x: 50 + labelWidth, y: textY, size: fontSize, font: useFont, color: rgb(0.2, 0.2, 0.2) });
+                textY -= lineHeight;
+                
+                for (let i = 1; i < lines.length; i++) {
+                    firstPage.drawText(lines[i], { x: 50 + labelWidth, y: textY, size: fontSize, font: useFont, color: rgb(0.2, 0.2, 0.2) });
+                    textY -= lineHeight;
+                }
+            } else {
+                textY -= lineHeight;
+            }
+            textY -= 5; // 항목 간 간격
         };
 
-        safeDraw("법원", metaInfo.court);
-        safeDraw("사건", metaInfo.caseNo);
-        // 여기에 모든 당사자(참가인 포함)가 출력됨
-        safeDraw("당사자", metaInfo.parties); 
-        safeDraw("대리인", metaInfo.lawyer);
+        drawField("법원", metaInfo.court);
+        drawField("사건", metaInfo.caseNo);
+        drawField("당사자(가명)", metaInfo.parties_anonymized);
+        drawField("대리인", metaInfo.lawyer_info);
+        
+        textY -= 10;
+        firstPage.drawText("[주 문 (가명 처리)]", { x: 50, y: textY, size: 12, font: useFont, color: rgb(0, 0, 0) });
+        textY -= 20;
+        drawField("", metaInfo.order_anonymized);
+
+        textY -= 10;
+        firstPage.drawText("[청구 취지 (가명 처리)]", { x: 50, y: textY, size: 12, font: useFont, color: rgb(0, 0, 0) });
+        textY -= 20;
+        drawField("", metaInfo.claim_anonymized);
 
         const pdfBytes = await pdfDoc.save();
 
