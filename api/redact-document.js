@@ -46,7 +46,7 @@ export default async function handler(req, res) {
         
         // Task A: Gemini 분석
         const analysisPromise = (async () => {
-            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-001" });
             const extractPrompt = `
             이 판결문 문서의 첫 페이지 상단을 읽고 다음 정보를 JSON으로 추출해.
             {
