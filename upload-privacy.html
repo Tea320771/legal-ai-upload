@@ -101,18 +101,31 @@
                 const base64 = await base64Promise;
 
                 // 2. API 호출 (파일명도 같이 보냄)
-                const response = await fetch('/api/redact-document', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ 
-                        fileBase64: base64, 
-                        fileName: file.name, // [추가] 파일명 전송
-                        fileType: file.type 
-                    })
-                });
 
-                const result = await response.json();
-                if (!result.success) throw new Error(result.error || "처리 실패");
+ // 기존: const response = await fetch(...)
+const response = await fetch('/api/redact-document', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ 
+        fileBase64: base64, 
+        fileName: file.name, 
+        fileType: file.type 
+    })
+});
+
+// [수정] JSON 파싱 전에 에러인지 먼저 확인
+const responseText = await response.text();
+
+if (!response.ok) {
+    // HTML 에러 페이지가 올 경우 태그 제거하고 앞부분만 보여줌
+    let errorMsg = responseText;
+    if (responseText.startsWith("<")) {
+        errorMsg = "서버 타임아웃(10초 초과) 또는 용량 초과입니다.";
+    }
+    throw new Error(`서버 오류 (${response.status}): ${errorMsg}`);
+}
+
+const result = JSON.parse(responseText); // 이제 안전하게 파싱
 
                 // 3. 완료 처리
                 updateStatus(i, `✅ 저장 완료 (${result.extractedMeta.court || '완료'})`, "done");
